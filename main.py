@@ -1,128 +1,27 @@
-import logging
 from openai import OpenAI
 import streamlit as st
-import psycopg2
+from app.chatlog.chatlog_handler import insert_chat_log
+from sidebar import setup_sidebar
+from app.db.database_connection import initialize_db
+from app.instructions.instructions_handler import get_latest_instructions
 
+# Title for now, no need subtitles. Can consider loading title/ subtitle from DB and enable users to edit
 st.title("CherGPT Basic")
 
-# Initialize session state for admin
-if "is_admin" not in st.session_state:
-    st.session_state["is_admin"] = False
+# Set up the sidebar and initialize DB
+initialize_db()
 
-# Initialize variables for custom and existing instructions
-custom_instructions = ""
-existing_instructions = ""
+# Ensure get_latest_instructions is called once and stored
+def setup_app():
+    if 'existing_instructions' not in st.session_state:
+        st.session_state['existing_instructions'] = get_latest_instructions()
+    setup_sidebar()
+
+setup_app()
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-with st.sidebar:
-    st.title("Settings")
-    with st.expander("Admin config"):
-        admin_password = st.text_input("Enter Admin Password", type="password")
-
-        if admin_password == st.secrets["ADMIN_PASSWORD"]:
-            st.session_state["is_admin"] = True
-            st.success("Authenticated as Admin")
-        elif admin_password:  # Only display message if something was entered
-            st.error("Incorrect password")
-            st.session_state["is_admin"] = False
-
-
-def connect_to_db():
-    try:
-        conn = psycopg2.connect(
-            st.secrets["DB_CONNECTION"]
-        )
-        logging.info("Successfully connected to the database.")
-        return conn
-    except Exception as e:
-        logging.error(f"Failed to connect to the database: {e}")
-        return None
-
-
-def create_instructions_table_if_not_exists():
-    conn = connect_to_db()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS instructions (
-                    id SERIAL PRIMARY KEY,
-                    content TEXT,
-                    timestamp TIMESTAMP DEFAULT current_timestamp
-                );
-            """)
-            conn.commit()
-            print("Checked for 'instructions' table; created if not exists.")
-    except Exception as e:
-        print(f"Error creating 'instructions' table: {e}")
-    finally:
-        conn.close()
-
-
-create_instructions_table_if_not_exists()
-
-
-def update_instructions(new_instructions):
-    conn = connect_to_db()
-    if conn is None:
-        logging.error("Failed to connect to the database.")
-        return
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO instructions (content)
-                VALUES (%s)
-                ON CONFLICT (id)
-                DO UPDATE SET content = EXCLUDED.content;
-            """, (new_instructions,))
-            conn.commit()
-            logging.info("Instructions updated successfully.")
-    except Exception as e:
-        logging.error(f"Error updating instructions: {e}")
-    finally:
-        conn.close()
-
-
-def get_latest_instructions():
-    conn = connect_to_db()
-    if conn is None:
-        logging.error("Failed to connect to the database.")
-        return ""
-
-    try:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT content FROM instructions ORDER BY id DESC LIMIT 1")
-            latest_instructions = cur.fetchone()
-            return latest_instructions[0] if latest_instructions else ""
-    except Exception as e:
-        logging.error(f"Error fetching latest instructions: {e}")
-        return ""
-    finally:
-        conn.close()
-
-
-existing_instructions = get_latest_instructions()
-custom_instructions = existing_instructions
-
-
-custominstructions_area_height = 300
-
-# Admin panel for custom instructions
-if st.session_state.get("is_admin"):
-    with st.sidebar:
-        st.title("Admin Panel")
-        existing_instructions = get_latest_instructions()
-        custom_instructions = st.text_area(
-            "Custom Instructions", value=existing_instructions,
-            height=custominstructions_area_height)
-
-        if st.button("Save Instructions"):
-            update_instructions(custom_instructions)
-            st.success("Instructions updated successfully")
-            st.experimental_rerun()
-
+#chatbot
 if "openai_model" not in st.session_state:
     st.session_state["openai_model"] = "gpt-3.5-turbo"
 
@@ -140,11 +39,10 @@ if prompt := st.chat_input("What is up?"):
     with st.chat_message("user"):
         st.markdown(prompt)
 
-    # Prepend custom instructions to the conversation context for processing
     conversation_context = []
-    if existing_instructions:
+    if 'existing_instructions' in st.session_state:
         conversation_context.append(
-            {"role": "system", "content": custom_instructions})
+            {"role": "system", "content": st.session_state['existing_instructions']})
 
     conversation_context += [
         {"role": m["role"], "content": m["content"]}
@@ -161,6 +59,7 @@ if prompt := st.chat_input("What is up?"):
         ):
             full_response += (response.choices[0].delta.content or "")
             message_placeholder.markdown(full_response + "▌")
+        insert_chat_log(prompt, full_response)
         message_placeholder.markdown(full_response)
 
     # Append the assistant's response to the messages for display
